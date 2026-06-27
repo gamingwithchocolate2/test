@@ -6,7 +6,7 @@
     <title>our chat</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0b0c; color: #e4e4e7; margin: 0; padding: 0; display: flex; justify-content: center; align-items: center; height: 100vh; }
-        .chat-container { width: 100%; max-width: 480px; height: 100vh; background: #121214; display: flex; flex-direction: column; width: 100vw; position: relative; }
+        .chat-container { width: 100%; max-width: 480px; height: 100vh; background: #121214; display: flex; flex-direction: column; width: 100vw; }
         
         .header { padding: 16px; background: #1a1a1e; border-bottom: 1px solid #27272a; display: flex; flex-direction: column; gap: 4px; }
         .header-top { display: flex; align-items: center; justify-content: space-between; }
@@ -38,11 +38,6 @@
         .icon-btn { background: none; border: none; color: #a1a1aa; font-size: 20px; cursor: pointer; padding: 4px; display: flex; align-items: center; justify-content: center; }
         .icon-btn:hover { color: #fff; }
         .icon-btn.recording { color: #ef4444; animation: blink 1s infinite; }
-
-        .call-overlay { position: absolute; top: 70px; left: 10px; right: 10px; height: 260px; background: #1a1a1e; border: 1px solid #3f3f46; border-radius: 12px; display: flex; flex-direction: column; z-index: 999; box-shadow: 0 10px 25px rgba(0,0,0,0.5); overflow: hidden; }
-        .call-overlay iframe { width: 100%; flex-grow: 1; border: none; }
-        .call-overlay-bar { background: #27272a; padding: 6px 12px; display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: bold; color: #fff; }
-        .close-call-btn { background: #ef4444; color: white; border: none; padding: 2px 8px; border-radius: 4px; cursor: pointer; }
         
         @keyframes blink { 50% { opacity: 0.5; } }
         .hidden { display: none !important; }
@@ -51,20 +46,12 @@
 <body>
 
 <div class="chat-container">
-    <div id="call-overlay" class="call-overlay hidden">
-        <div class="call-overlay-bar">
-            <span>🔴 Live Audio Room</span>
-            <button id="close-call-btn" class="close-call-btn">Disconnect</button>
-        </div>
-        <iframe id="call-iframe" allow="microphone"></iframe>
-    </div>
-
     <div class="header">
         <div class="header-top">
             <h1>our chat</h1>
             <div class="header-actions">
                 <button id="call-btn" class="call-btn hidden">📞 Call</button>
-                <div id="members-count" class="members-indicator hidden">1 online</div>
+                <div id="members-count" class="members-indicator hidden">0 online</div>
             </div>
         </div>
         <div id="members-names" class="member-list hidden"></div>
@@ -93,9 +80,7 @@
     let roomKey = '';
     let myUsername = 'User';
     const myId = Math.random().toString(36).substr(2, 9);
-    let eventSource = null;
     let knownMessages = new Set();
-    let onlineUsers = {};
 
     let mediaRecorder;
     let audioChunks = [];
@@ -106,8 +91,6 @@
     const joinBtn = document.getElementById('join-btn'), callBtn = document.getElementById('call-btn');
     const countTag = document.getElementById('members-count'), namesTag = document.getElementById('members-names');
     const imageInput = document.getElementById('image-input');
-    
-    const callOverlay = document.getElementById('call-overlay'), callIframe = document.getElementById('call-iframe'), closeCallBtn = document.getElementById('close-call-btn');
 
     joinBtn.onclick = () => {
         const userIn = document.getElementById('username-input').value.trim();
@@ -115,7 +98,7 @@
         if (!userIn || !roomIn) return alert('Fill out both boxes first');
         
         myUsername = userIn;
-        roomKey = 'stream_' + btoa(roomIn).replace(/[^a-zA-Z0-9]/g, '').toLowerCase().substr(0, 20);
+        roomKey = 'room_' + btoa(roomIn).replace(/[^a-zA-Z0-9]/g, '').toLowerCase().substr(0, 20);
         
         setupView.classList.add('hidden');
         chatView.classList.remove('hidden');
@@ -123,65 +106,58 @@
         namesTag.classList.remove('hidden');
         callBtn.classList.remove('hidden');
         
-        startLiveStream();
+        pollSync();
         sendHeartbeat();
-        setInterval(sendHeartbeat, 4000); // Send background presence ping every 4 seconds
-        setInterval(checkPresenceExpiry, 2000); // Prune inactive connections locally
+        
+        setInterval(pollSync, 2000);      
+        setInterval(sendHeartbeat, 5000);  
     };
 
-    function startLiveStream() {
-        if (eventSource) eventSource.close();
+    async function pollSync() {
+        try {
+            const res = await fetch(`https://ntfy.sh/${roomKey}/json?poll=1`);
+            if (!res.ok) return;
+            
+            const rawText = await res.text();
+            const lines = rawText.trim().split('\n');
+            
+            let onlineUsers = {};
+            const now = Date.now();
 
-        // Establish a persistent Server-Sent Events stream link
-        eventSource = new EventSource(`https://ntfy.sh/${roomKey}/sse`);
-
-        eventSource.onmessage = (event) => {
-            try {
-                const entry = JSON.parse(event.data);
-                if (!entry.message) return;
+            lines.forEach(line => {
+                if (!line) return;
+                const entry = JSON.parse(line);
                 
-                const payload = JSON.parse(entry.message);
-                
-                if (payload.type === 'chat' && !knownMessages.has(payload.id)) {
-                    knownMessages.add(payload.id);
-                    renderSingleMessage(payload);
-                } else if (payload.type === 'status') {
-                    onlineUsers[payload.sender] = { name: payload.name, lastSeen: Date.now() };
-                    updatePresenceUI();
+                if (entry.message) {
+                    try {
+                        const payload = JSON.parse(entry.message);
+                        
+                        if (payload.type === 'chat' && !knownMessages.has(payload.id)) {
+                            knownMessages.add(payload.id);
+                            renderSingleMessage(payload);
+                        } else if (payload.type === 'status') {
+                            if (now - payload.time < 12000) {
+                                onlineUsers[payload.sender] = payload.name;
+                            }
+                        }
+                    } catch(e) {}
                 }
-            } catch(e) {}
-        };
+            });
 
-        eventSource.onerror = () => {
-            // Auto-reconnect instantly if phone network drops momentarily
-            setTimeout(startLiveStream, 1000);
-        };
-    }
+            onlineUsers[myId] = myUsername;
 
-    function updatePresenceUI() {
-        onlineUsers[myId] = { name: myUsername, lastSeen: Date.now() };
-        const activeNames = Object.values(onlineUsers).map(u => u.name);
-        countTag.textContent = `${activeNames.length} online`;
-        namesTag.textContent = activeNames.join(', ');
-    }
+            const userArray = Object.values(onlineUsers);
+            countTag.textContent = `${userArray.length} online`;
+            namesTag.textContent = userArray.join(', ');
 
-    function checkPresenceExpiry() {
-        const now = Date.now();
-        let changed = false;
-        for (let id in onlineUsers) {
-            if (id !== myId && now - onlineUsers[id].lastSeen > 10000) {
-                delete onlineUsers[id];
-                changed = true;
-            }
-        }
-        if (changed) updatePresenceUI();
+        } catch (e) {}
     }
 
     async function sendHeartbeat() {
         try {
             await fetch(`https://ntfy.sh/${roomKey}`, {
                 method: 'POST',
-                body: JSON.stringify({ type: 'status', sender: myId, name: myUsername })
+                body: JSON.stringify({ type: 'status', sender: myId, name: myUsername, time: Date.now() })
             });
         } catch(e) {}
     }
@@ -198,16 +174,25 @@
     function sendText() {
         const val = textInput.value.trim();
         if (!val) return;
+
         textInput.value = '';
         
         const msgId = Math.random().toString(36).substr(2, 9);
-        const msgPayload = { type: 'chat', id: msgId, dataType: 'text', sender: myId, name: myUsername, text: val };
+        const msgPayload = {
+            type: 'chat',
+            id: msgId,
+            dataType: 'text',
+            sender: myId,
+            name: myUsername,
+            text: val
+        };
 
         knownMessages.add(msgId);
         renderSingleMessage(msgPayload);
         transmitPayload(msgPayload);
     }
 
+    // Handles uploading image files directly to a free, fast, anonymous server endpoint
     document.getElementById('attach-btn').onclick = () => imageInput.click();
     imageInput.onchange = async () => {
         const file = imageInput.files[0];
@@ -217,12 +202,23 @@
         formData.append('file', file);
 
         try {
-            const uploadRes = await fetch('https://tmpfiles.org/api/v1/upload', { method: 'POST', body: formData });
+            const uploadRes = await fetch('https://tmpfiles.org/api/v1/upload', {
+                method: 'POST',
+                body: formData
+            });
             const uploadData = await uploadRes.json();
+            // Convert standard viewing path from the API block directly
             const finalUrl = uploadData.data.url.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
 
             const msgId = Math.random().toString(36).substr(2, 9);
-            const msgPayload = { type: 'chat', id: msgId, dataType: 'image', sender: myId, name: myUsername, url: finalUrl };
+            const msgPayload = {
+                type: 'chat',
+                id: msgId,
+                dataType: 'image',
+                sender: myId,
+                name: myUsername,
+                url: finalUrl
+            };
 
             knownMessages.add(msgId);
             renderSingleMessage(msgPayload);
@@ -230,6 +226,7 @@
         } catch (err) { alert("Failed to upload image."); }
     };
 
+    // Voice Recorder handling audio file uploads seamlessly without text string blooming
     document.getElementById('mic-btn').onclick = async function() {
         const micBtn = this;
         if (!isRecording) {
@@ -247,17 +244,28 @@
                     formData.append('file', audioFile);
 
                     try {
-                        const uploadRes = await fetch('https://tmpfiles.org/api/v1/upload', { method: 'POST', body: formData });
+                        const uploadRes = await fetch('https://tmpfiles.org/api/v1/upload', {
+                            method: 'POST',
+                            body: formData
+                        });
                         const uploadData = await uploadRes.json();
                         const finalUrl = uploadData.data.url.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
 
                         const msgId = Math.random().toString(36).substr(2, 9);
-                        const msgPayload = { type: 'chat', id: msgId, dataType: 'voice', sender: myId, name: myUsername, url: finalUrl };
+                        const msgPayload = {
+                            type: 'chat',
+                            id: msgId,
+                            dataType: 'voice',
+                            sender: myId,
+                            name: myUsername,
+                            url: finalUrl
+                        };
 
                         knownMessages.add(msgId);
                         renderSingleMessage(msgPayload);
                         transmitPayload(msgPayload);
                     } catch(e) { alert("Failed to send voice note."); }
+
                     stream.getTracks().forEach(track => track.stop());
                 };
 
@@ -274,24 +282,25 @@
         }
     };
 
-    function launchCallInterface() {
-        const callRoomName = roomKey.substr(0, 15) + "_call";
-        const callUrl = `https://meet.jit.si/${callRoomName}#config.startWithVideoMuted=true&config.startWithAudioMuted=false&config.prejoinPageEnabled=false`;
-        
-        callIframe.src = callUrl;
-        callOverlay.classList.remove('hidden');
-    }
-
     callBtn.onclick = () => {
-        launchCallInterface();
+        const callRoomName = roomKey.substr(0, 15) + "_call";
+        const callUrl = `https://meet.jit.si/${callRoomName}`;
+        
         const msgId = Math.random().toString(36).substr(2, 9);
-        const msgPayload = { type: 'chat', id: msgId, dataType: 'call', sender: myId, name: myUsername, text: `Started an audio room voice call.` };
+        const msgPayload = {
+            type: 'chat',
+            id: msgId,
+            dataType: 'call',
+            sender: myId,
+            name: myUsername,
+            text: `Join our private audio call room`,
+            url: callUrl
+        };
+        
+        knownMessages.add(msgId);
+        renderSingleMessage(msgPayload);
         transmitPayload(msgPayload);
-    };
-
-    closeCallBtn.onclick = () => {
-        callIframe.src = '';
-        callOverlay.classList.add('hidden');
+        window.open(callUrl, '_blank');
     };
 
     function renderSingleMessage(msg) {
@@ -308,7 +317,7 @@
         } else if (msg.dataType === 'voice') {
             bubble.innerHTML = nameHeader + `<audio src="${msg.url}" controls></audio>`;
         } else if (msg.dataType === 'call') {
-            bubble.innerHTML = nameHeader + `📞 <span class="call-link" onclick="launchCallInterface()">${msg.text}</span>`;
+            bubble.innerHTML = nameHeader + `📞 <a href="${msg.url}" target="_blank" class="call-link">${msg.text}</a>`;
         }
         
         messagesContainer.appendChild(bubble);
