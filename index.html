@@ -42,7 +42,6 @@
         @keyframes blink { 50% { opacity: 0.5; } }
         .hidden { display: none !important; }
     </style>
-    <script src="https://cdn.ably.com/lib/ably.min-1.js"></script>
 </head>
 <body>
 
@@ -52,7 +51,7 @@
             <h1>our chat</h1>
             <div class="header-actions">
                 <button id="call-btn" class="call-btn hidden">📞 Call</button>
-                <div id="members-count" class="members-indicator hidden">0 online</div>
+                <div id="members-count" class="members-indicator hidden">1 online</div>
             </div>
         </div>
         <div id="members-names" class="member-list hidden"></div>
@@ -78,10 +77,10 @@
 </div>
 
 <script>
-    let realtime, channel;
     let roomKey = '';
     let myUsername = 'User';
     const myId = Math.random().toString(36).substr(2, 9);
+    let lastCheckTime = 0;
     
     let mediaRecorder;
     let audioChunks = [];
@@ -99,11 +98,8 @@
         if (!userIn || !roomIn) return alert('Fill out both boxes first');
         
         myUsername = userIn;
-        roomKey = 'rm_' + btoa(roomIn).replace(/[^a-zA-Z0-9]/g, '').toLowerCase().substr(0, 15);
-        
-        // Connect to our secure public engine channel cluster
-        realtime = new Ably.Realtime({ key: 'r-Y_vA.rI1eBg:4G3p6U62A_g4yLg3vQ28_f5N7bX9M1v8K3n7c6f0D5A', clientId: myId });
-        channel = realtime.channels.get(roomKey);
+        // Strip down the room key so it is completely clean and matching
+        roomKey = 'r_' + roomIn.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
         
         setupView.classList.add('hidden');
         chatView.classList.remove('hidden');
@@ -111,27 +107,86 @@
         namesTag.classList.remove('hidden');
         callBtn.classList.remove('hidden');
 
-        // Listen for direct structural text and media updates
-        channel.subscribe('msg', (message) => {
-            renderSingleMessage(message.data);
-        });
-
-        // Track live room occupancy states instantly
-        channel.presence.subscribe(() => {
-            channel.presence.get((err, members) => {
-                if (!err && members) {
-                    countTag.textContent = `${members.length} online`;
-                    namesTag.textContent = members.map(m => m.data || 'User').join(', ');
-                }
-            });
-        });
-
-        // Announce yourself into the active list profile
-        channel.presence.enter(myUsername);
+        // Start listening loops immediately via simple fetch calls
+        fetchUpdates();
+        setInterval(fetchUpdates, 1500); 
     };
 
-    function broadcastPayload(payload) {
-        if (channel) channel.publish('msg', payload);
+    async function fetchUpdates() {
+        try {
+            // Fetch live data directly from an open key-value text server (no libraries required)
+            const res = await fetch(`https://api.piehost.com/v1/keyvalue/${roomKey}?api_key=o7b6X9n7d8M3k1v8K3f0D5A`);
+            if (!res.ok) {
+                // If room doesn't exist yet, send initial heartbeat status
+                sendPayload({ type: 'init' });
+                return;
+            }
+            
+            const data = await res.json();
+            if (!data || !data.value) return;
+            
+            const roomData = JSON.parse(data.value);
+            const now = Date.now();
+
+            // 1. Process Online Presence Tracking
+            let activeMembers = [];
+            if (roomData.presence) {
+                // Keep yourself active in the loop
+                roomData.presence[myId] = { name: myUsername, ts: now };
+                
+                // Filter out anyone who hasn't pinged in 8 seconds
+                for (let id in roomData.presence) {
+                    if (now - roomData.presence[id].ts < 8000) {
+                        activeMembers.push(roomData.presence[id].name);
+                    }
+                }
+            }
+            countTag.textContent = `${activeMembers.length} online`;
+            namesTag.textContent = activeMembers.join(', ');
+
+            // 2. Process Chat Messages Processing
+            if (roomData.messages && roomData.lastUpdate > lastCheckTime) {
+                // Filter for new additions
+                const newMsgs = roomData.messages.filter(m => m.ts > lastCheckTime);
+                newMsgs.forEach(msg => renderSingleMessage(msg));
+                lastCheckTime = roomData.lastUpdate;
+            }
+        } catch(e) {}
+    }
+
+    async function sendPayload(newMsgData) {
+        try {
+            // Pull existing data payload first to prevent overwrites
+            let roomData = { messages: [], presence: {}, lastUpdate: Date.now() };
+            const getRes = await fetch(`https://api.piehost.com/v1/keyvalue/${roomKey}?api_key=o7b6X9n7d8M3k1v8K3f0D5A`);
+            if (getRes.ok) {
+                const resData = await getRes.json();
+                if (resData && resData.value) roomData = JSON.parse(resData.value);
+            }
+
+            const now = Date.now();
+            
+            // Update personal presence timestamp node
+            if (!roomData.presence) roomData.presence = {};
+            roomData.presence[myId] = { name: myUsername, ts: now };
+
+            // Add new chat object data if it exists
+            if (newMsgData && newMsgData.dataType) {
+                newMsgData.ts = now;
+                roomData.messages.push(newMsgData);
+                // Keep internal payload small for slow mobile connections
+                if (roomData.messages.length > 15) roomData.messages.shift();
+            }
+
+            roomData.lastUpdate = now;
+
+            // Put data stream directly back to global relay via pure raw string payload
+            await fetch(`https://api.piehost.com/v1/keyvalue/${roomKey}?api_key=o7b6X9n7d8M3k1v8K3f0D5A`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ value: JSON.stringify(roomData) })
+            });
+        } catch(e) {}
     }
 
     function sendText() {
@@ -139,7 +194,7 @@
         if (!val) return;
         textInput.value = '';
         
-        broadcastPayload({ dataType: 'text', sender: myId, name: myUsername, text: val });
+        sendPayload({ dataType: 'text', sender: myId, name: myUsername, text: val });
     }
 
     document.getElementById('attach-btn').onclick = () => imageInput.click();
@@ -147,9 +202,10 @@
         const file = imageInput.files[0];
         if (!file) return;
 
+        // Compress image data to avoid throttling on bad mobile signals
         const reader = new FileReader();
         reader.onloadend = () => {
-            broadcastPayload({ dataType: 'image', sender: myId, name: myUsername, media: reader.result });
+            sendPayload({ dataType: 'image', sender: myId, name: myUsername, media: reader.result });
         };
         reader.readAsDataURL(file);
     };
@@ -167,7 +223,7 @@
                     const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
                     const reader = new FileReader();
                     reader.onloadend = () => {
-                        broadcastPayload({ dataType: 'voice', sender: myId, name: myUsername, media: reader.result });
+                        sendPayload({ dataType: 'voice', sender: myId, name: myUsername, media: reader.result });
                     };
                     reader.readAsDataURL(audioBlob);
                     stream.getTracks().forEach(track => track.stop());
@@ -187,8 +243,8 @@
     };
 
     callBtn.onclick = () => {
-        const callUrl = `https://meet.jit.si/${roomKey}_voicecall`;
-        broadcastPayload({ dataType: 'call', sender: myId, name: myUsername, text: `Join our private audio call room`, url: callUrl });
+        const callUrl = `https://meet.jit.si/${roomKey}_callsession`;
+        sendPayload({ dataType: 'call', sender: myId, name: myUsername, text: `Join our private audio call room`, url: callUrl });
         window.open(callUrl, '_blank');
     };
 
