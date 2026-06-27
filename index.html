@@ -39,7 +39,6 @@
         .icon-btn:hover { color: #fff; }
         .icon-btn.recording { color: #ef4444; animation: blink 1s infinite; }
 
-        /* In-app voice panel frame system overlays */
         .call-overlay { position: absolute; top: 70px; left: 10px; right: 10px; height: 260px; background: #1a1a1e; border: 1px solid #3f3f46; border-radius: 12px; display: flex; flex-direction: column; z-index: 999; box-shadow: 0 10px 25px rgba(0,0,0,0.5); overflow: hidden; }
         .call-overlay iframe { width: 100%; flex-grow: 1; border: none; }
         .call-overlay-bar { background: #27272a; padding: 6px 12px; display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: bold; color: #fff; }
@@ -65,7 +64,7 @@
             <h1>our chat</h1>
             <div class="header-actions">
                 <button id="call-btn" class="call-btn hidden">📞 Call</button>
-                <div id="members-count" class="members-indicator hidden">0 online</div>
+                <div id="members-count" class="members-indicator hidden">1 online</div>
             </div>
         </div>
         <div id="members-names" class="member-list hidden"></div>
@@ -94,7 +93,9 @@
     let roomKey = '';
     let myUsername = 'User';
     const myId = Math.random().toString(36).substr(2, 9);
+    let eventSource = null;
     let knownMessages = new Set();
+    let onlineUsers = {};
 
     let mediaRecorder;
     let audioChunks = [];
@@ -114,7 +115,7 @@
         if (!userIn || !roomIn) return alert('Fill out both boxes first');
         
         myUsername = userIn;
-        roomKey = 'room_' + btoa(roomIn).replace(/[^a-zA-Z0-9]/g, '').toLowerCase().substr(0, 20);
+        roomKey = 'stream_' + btoa(roomIn).replace(/[^a-zA-Z0-9]/g, '').toLowerCase().substr(0, 20);
         
         setupView.classList.add('hidden');
         chatView.classList.remove('hidden');
@@ -122,58 +123,65 @@
         namesTag.classList.remove('hidden');
         callBtn.classList.remove('hidden');
         
-        pollSync();
+        startLiveStream();
         sendHeartbeat();
-        
-        setInterval(pollSync, 2000);      
-        setInterval(sendHeartbeat, 5000);  
+        setInterval(sendHeartbeat, 4000); // Send background presence ping every 4 seconds
+        setInterval(checkPresenceExpiry, 2000); // Prune inactive connections locally
     };
 
-    async function pollSync() {
-        try {
-            const res = await fetch(`https://ntfy.sh/${roomKey}/json?poll=1`);
-            if (!res.ok) return;
-            
-            const rawText = await res.text();
-            const lines = rawText.trim().split('\n');
-            
-            let onlineUsers = {};
-            const now = Date.now();
+    function startLiveStream() {
+        if (eventSource) eventSource.close();
 
-            lines.forEach(line => {
-                if (!line) return;
-                const entry = JSON.parse(line);
+        // Establish a persistent Server-Sent Events stream link
+        eventSource = new EventSource(`https://ntfy.sh/${roomKey}/sse`);
+
+        eventSource.onmessage = (event) => {
+            try {
+                const entry = JSON.parse(event.data);
+                if (!entry.message) return;
                 
-                if (entry.message) {
-                    try {
-                        const payload = JSON.parse(entry.message);
-                        
-                        if (payload.type === 'chat' && !knownMessages.has(payload.id)) {
-                            knownMessages.add(payload.id);
-                            renderSingleMessage(payload);
-                        } else if (payload.type === 'status') {
-                            if (now - payload.time < 12000) {
-                                onlineUsers[payload.sender] = payload.name;
-                            }
-                        }
-                    } catch(e) {}
+                const payload = JSON.parse(entry.message);
+                
+                if (payload.type === 'chat' && !knownMessages.has(payload.id)) {
+                    knownMessages.add(payload.id);
+                    renderSingleMessage(payload);
+                } else if (payload.type === 'status') {
+                    onlineUsers[payload.sender] = { name: payload.name, lastSeen: Date.now() };
+                    updatePresenceUI();
                 }
-            });
+            } catch(e) {}
+        };
 
-            onlineUsers[myId] = myUsername;
+        eventSource.onerror = () => {
+            // Auto-reconnect instantly if phone network drops momentarily
+            setTimeout(startLiveStream, 1000);
+        };
+    }
 
-            const userArray = Object.values(onlineUsers);
-            countTag.textContent = `${userArray.length} online`;
-            namesTag.textContent = userArray.join(', ');
+    function updatePresenceUI() {
+        onlineUsers[myId] = { name: myUsername, lastSeen: Date.now() };
+        const activeNames = Object.values(onlineUsers).map(u => u.name);
+        countTag.textContent = `${activeNames.length} online`;
+        namesTag.textContent = activeNames.join(', ');
+    }
 
-        } catch (e) {}
+    function checkPresenceExpiry() {
+        const now = Date.now();
+        let changed = false;
+        for (let id in onlineUsers) {
+            if (id !== myId && now - onlineUsers[id].lastSeen > 10000) {
+                delete onlineUsers[id];
+                changed = true;
+            }
+        }
+        if (changed) updatePresenceUI();
     }
 
     async function sendHeartbeat() {
         try {
             await fetch(`https://ntfy.sh/${roomKey}`, {
                 method: 'POST',
-                body: JSON.stringify({ type: 'status', sender: myId, name: myUsername, time: Date.now() })
+                body: JSON.stringify({ type: 'status', sender: myId, name: myUsername })
             });
         } catch(e) {}
     }
@@ -190,7 +198,6 @@
     function sendText() {
         const val = textInput.value.trim();
         if (!val) return;
-
         textInput.value = '';
         
         const msgId = Math.random().toString(36).substr(2, 9);
@@ -267,10 +274,8 @@
         }
     };
 
-    // Launches the call frame completely inside the app page without shifting windows
     function launchCallInterface() {
         const callRoomName = roomKey.substr(0, 15) + "_call";
-        // config flags trigger pure automated audio setups to prevent browser rendering faults
         const callUrl = `https://meet.jit.si/${callRoomName}#config.startWithVideoMuted=true&config.startWithAudioMuted=false&config.prejoinPageEnabled=false`;
         
         callIframe.src = callUrl;
@@ -303,7 +308,6 @@
         } else if (msg.dataType === 'voice') {
             bubble.innerHTML = nameHeader + `<audio src="${msg.url}" controls></audio>`;
         } else if (msg.dataType === 'call') {
-            // Clicking the notification link inside the chat room will also safely toggle the internal window frame
             bubble.innerHTML = nameHeader + `📞 <span class="call-link" onclick="launchCallInterface()">${msg.text}</span>`;
         }
         
