@@ -59,16 +59,13 @@
 <script>
     let roomKey = '';
     let myUsername = 'User';
-    let chatHistory = [];
     const myId = Math.random().toString(36).substr(2, 9);
+    let knownMessages = new Set();
 
     const setupView = document.getElementById('setup-view'), chatView = document.getElementById('chat-view');
     const messagesContainer = document.getElementById('messages-container'), textInput = document.getElementById('text-input');
     const joinBtn = document.getElementById('join-btn');
     const countTag = document.getElementById('members-count'), namesTag = document.getElementById('members-names');
-
-    // Cleaned public Key-Value endpoint bucket
-    const bucketUrl = "https://kvdb.io/v3mN98Vf6H7v89bNf6vH89/";
 
     joinBtn.onclick = () => {
         const userIn = document.getElementById('username-input').value.trim();
@@ -76,60 +73,72 @@
         if (!userIn || !roomIn) return alert('Fill out both boxes first');
         
         myUsername = userIn;
-        // Strip out bad characters directly so room codes match 1:1 across devices
-        roomKey = 'room_' + roomIn.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+        // Generate a completely unique, un-clashable room topic identifier
+        roomKey = 'room_' + btoa(roomIn).replace(/[^a-zA-Z0-9]/g, '').toLowerCase().substr(0, 20);
         
         setupView.classList.add('hidden');
         chatView.classList.remove('hidden');
         countTag.classList.remove('hidden');
         namesTag.classList.remove('hidden');
         
-        syncChat();
-        syncMembers();
+        // Instant data sync pipeline
+        pollSync();
+        sendHeartbeat();
         
-        setInterval(syncChat, 2000);   
-        setInterval(syncMembers, 4000); 
+        setInterval(pollSync, 2000);      // Fetch new global data nodes every 2 seconds
+        setInterval(sendHeartbeat, 5000);  // Announce presence every 5 seconds
     };
 
-    async function syncChat() {
+    async function pollSync() {
         try {
-            const res = await fetch(`${bucketUrl}${roomKey}_msgs`);
+            // Grab the cached stream history directly from the open relay cluster
+            const res = await fetch(`https://ntfy.sh/${roomKey}/json?poll=1`);
             if (!res.ok) return;
-            const data = await res.json();
             
-            if (data && JSON.stringify(data) !== JSON.stringify(chatHistory)) {
-                chatHistory = data;
-                renderMessages();
-            }
+            const rawText = await res.text();
+            const lines = rawText.trim().split('\n');
+            
+            let onlineUsers = {};
+            const now = Date.now();
+
+            lines.forEach(line => {
+                if (!line) return;
+                const entry = JSON.parse(line);
+                
+                // Read the custom payload attached to the inbound network node
+                if (entry.message) {
+                    try {
+                        const payload = JSON.parse(entry.message);
+                        
+                        if (payload.type === 'chat' && !knownMessages.has(payload.id)) {
+                            knownMessages.add(payload.id);
+                            renderSingleMessage(payload);
+                        } else if (payload.type === 'status') {
+                            // Track active nodes seen within the last 12 seconds
+                            if (now - payload.time < 12000) {
+                                onlineUsers[payload.sender] = payload.name;
+                            }
+                        }
+                    } catch(e) {}
+                }
+            });
+
+            // Always make sure you're counted as active on your own screen
+            onlineUsers[myId] = myUsername;
+
+            const userArray = Object.values(onlineUsers);
+            countTag.textContent = `${userArray.length} online`;
+            namesTag.textContent = userArray.join(', ');
+
         } catch (e) {}
     }
 
-    async function syncMembers() {
+    async function sendHeartbeat() {
         try {
-            let membersMap = {};
-            const res = await fetch(`${bucketUrl}${roomKey}_mbrs`);
-            if (res.ok) {
-                const text = await res.text();
-                if(text && text !== "null") membersMap = JSON.parse(text);
-            }
-
-            membersMap[myId] = { name: myUsername, lastSeen: Date.now() };
-
-            const now = Date.now();
-            for (let id in membersMap) {
-                if (now - membersMap[id].lastSeen > 12000) delete membersMap[id];
-            }
-
-            // Fixed method to PUT so it successfully updates online status globally
-            await fetch(`${bucketUrl}${roomKey}_mbrs`, {
-                method: 'PUT',
-                body: JSON.stringify(membersMap)
+            await fetch(`https://ntfy.sh/${roomKey}`, {
+                method: 'POST',
+                body: JSON.stringify({ type: 'status', sender: myId, name: myUsername, time: Date.now() })
             });
-
-            const currentUsers = Object.values(membersMap);
-            countTag.textContent = `${currentUsers.length} online`;
-            namesTag.textContent = currentUsers.map(u => u.name).join(', ');
-
         } catch(e) {}
     }
 
@@ -138,38 +147,35 @@
         if (!val) return;
 
         textInput.value = '';
-
-        try {
-            const res = await fetch(`${bucketUrl}${roomKey}_msgs`);
-            if (res.ok) {
-                const text = await res.text();
-                if(text && text !== "null") chatHistory = JSON.parse(text);
-            }
-        } catch(e) {}
         
-        chatHistory.push({ sender: myId, text: val, name: myUsername });
-        renderMessages();
+        const msgId = Math.random().toString(36).substr(2, 9);
+        const msgPayload = {
+            type: 'chat',
+            id: msgId,
+            sender: myId,
+            name: myUsername,
+            text: val
+        };
 
-        if (chatHistory.length > 30) chatHistory.shift();
+        // Render directly on our screen immediately
+        knownMessages.add(msgId);
+        renderSingleMessage(msgPayload);
 
         try {
-            // Fixed method to PUT to guarantee messages successfully push to her phone
-            await fetch(`${bucketUrl}${roomKey}_msgs`, {
-                method: 'PUT',
-                body: JSON.stringify(chatHistory)
+            // Push payload stream onto the global server channel
+            await fetch(`https://ntfy.sh/${roomKey}`, {
+                method: 'POST',
+                body: JSON.stringify(msgPayload)
             });
         } catch (e) {}
     }
 
-    function renderMessages() {
-        messagesContainer.innerHTML = '';
-        chatHistory.forEach(msg => {
-            const bubble = document.createElement('div');
-            const side = msg.sender === myId ? 'me' : 'them';
-            bubble.className = `msg ${side}`;
-            bubble.innerText = side === 'them' ? `${msg.name}: ${msg.text}` : msg.text;
-            messagesContainer.appendChild(bubble);
-        });
+    function renderSingleMessage(msg) {
+        const bubble = document.createElement('div');
+        const side = msg.sender === myId ? 'me' : 'them';
+        bubble.className = `msg ${side}`;
+        bubble.innerText = side === 'them' ? `${msg.name}: ${msg.text}` : msg.text;
+        messagesContainer.appendChild(bubble);
         messagesContainer.scrollTop = messagesContainer.scrollHeight;
     }
 
