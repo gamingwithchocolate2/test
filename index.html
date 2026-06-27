@@ -12,6 +12,9 @@
         .header-top { display: flex; align-items: center; justify-content: space-between; }
         .header h1 { margin: 0; font-size: 18px; font-weight: 600; color: #fff; }
         
+        .header-actions { display: flex; align-items: center; gap: 10px; }
+        .call-btn { background: #22c55e; color: white; border: none; padding: 6px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; cursor: pointer; }
+        
         .members-indicator { font-size: 12px; color: #a1a1aa; background: #27272a; padding: 4px 8px; border-radius: 12px; display: flex; align-items: center; gap: 6px; font-weight: 500; }
         .members-indicator::before { content: ''; display: inline-block; width: 6px; height: 6px; background: #22c55e; border-radius: 50%; }
         .member-list { font-size: 11px; color: #71717a; margin: 0; padding-top: 2px; }
@@ -25,8 +28,18 @@
         .msg.me { background: #2563eb; color: #fff; align-self: flex-end; border-bottom-right-radius: 4px; }
         .msg.them { background: #27272a; color: #e4e4e7; align-self: flex-start; border-bottom-left-radius: 4px; }
         
+        .msg img { max-width: 100%; border-radius: 8px; margin-top: 4px; display: block; }
+        .msg audio { max-width: 100%; margin-top: 4px; display: block; }
+        .call-link { color: #3b82f6; text-decoration: underline; font-weight: bold; cursor: pointer; }
+
         .input-bar { padding: 12px; background: #1a1a1e; border-top: 1px solid #27272a; display: flex; align-items: center; gap: 8px; }
         .input-bar input { flex-grow: 1; background: #27272a; border: 1px solid #3f3f46; color: #fff; padding: 10px; border-radius: 8px; outline: none; }
+        
+        .icon-btn { background: none; border: none; color: #a1a1aa; font-size: 20px; cursor: pointer; padding: 4px; display: flex; align-items: center; justify-content: center; }
+        .icon-btn:hover { color: #fff; }
+        .icon-btn.recording { color: #ef4444; animation: blink 1s infinite; }
+        
+        @keyframes blink { 50% { opacity: 0.5; } }
         .hidden { display: none !important; }
     </style>
 </head>
@@ -36,7 +49,10 @@
     <div class="header">
         <div class="header-top">
             <h1>our chat</h1>
-            <div id="members-count" class="members-indicator hidden">0 online</div>
+            <div class="header-actions">
+                <button id="call-btn" class="call-btn hidden">📞 Call</button>
+                <div id="members-count" class="members-indicator hidden">0 online</div>
+            </div>
         </div>
         <div id="members-names" class="member-list hidden"></div>
     </div>
@@ -50,6 +66,10 @@
     <div id="chat-view" class="chat-screen hidden" style="display: flex; flex-direction: column; flex-grow: 1;">
         <div id="messages-container" class="messages"></div>
         <div class="input-bar">
+            <input type="file" id="image-input" accept="image/*" class="hidden">
+            <button id="attach-btn" class="icon-btn">📎</button>
+            <button id="mic-btn" class="icon-btn">🎤</button>
+            
             <input type="text" id="text-input" placeholder="Message">
             <button id="send-btn" style="background: none; color: #3b82f6; font-size: 18px; border:none; cursor:pointer;">➔</button>
         </div>
@@ -61,11 +81,17 @@
     let myUsername = 'User';
     const myId = Math.random().toString(36).substr(2, 9);
     let knownMessages = new Set();
+    
+    // Voice Message Recorder States
+    let mediaRecorder;
+    let audioChunks = [];
+    let isRecording = false;
 
     const setupView = document.getElementById('setup-view'), chatView = document.getElementById('chat-view');
     const messagesContainer = document.getElementById('messages-container'), textInput = document.getElementById('text-input');
-    const joinBtn = document.getElementById('join-btn');
+    const joinBtn = document.getElementById('join-btn'), callBtn = document.getElementById('call-btn');
     const countTag = document.getElementById('members-count'), namesTag = document.getElementById('members-names');
+    const imageInput = document.getElementById('image-input');
 
     joinBtn.onclick = () => {
         const userIn = document.getElementById('username-input').value.trim();
@@ -73,31 +99,28 @@
         if (!userIn || !roomIn) return alert('Fill out both boxes first');
         
         myUsername = userIn;
-        // Generate a completely unique, un-clashable room topic identifier
         roomKey = 'room_' + btoa(roomIn).replace(/[^a-zA-Z0-9]/g, '').toLowerCase().substr(0, 20);
         
         setupView.classList.add('hidden');
         chatView.classList.remove('hidden');
         countTag.classList.remove('hidden');
         namesTag.classList.remove('hidden');
+        callBtn.classList.remove('hidden');
         
-        // Instant data sync pipeline
         pollSync();
         sendHeartbeat();
         
-        setInterval(pollSync, 2000);      // Fetch new global data nodes every 2 seconds
-        setInterval(sendHeartbeat, 5000);  // Announce presence every 5 seconds
+        setInterval(pollSync, 2000);
+        setInterval(sendHeartbeat, 5000);
     };
 
     async function pollSync() {
         try {
-            // Grab the cached stream history directly from the open relay cluster
             const res = await fetch(`https://ntfy.sh/${roomKey}/json?poll=1`);
             if (!res.ok) return;
             
             const rawText = await res.text();
             const lines = rawText.trim().split('\n');
-            
             let onlineUsers = {};
             const now = Date.now();
 
@@ -105,16 +128,13 @@
                 if (!line) return;
                 const entry = JSON.parse(line);
                 
-                // Read the custom payload attached to the inbound network node
                 if (entry.message) {
                     try {
                         const payload = JSON.parse(entry.message);
-                        
                         if (payload.type === 'chat' && !knownMessages.has(payload.id)) {
                             knownMessages.add(payload.id);
                             renderSingleMessage(payload);
                         } else if (payload.type === 'status') {
-                            // Track active nodes seen within the last 12 seconds
                             if (now - payload.time < 12000) {
                                 onlineUsers[payload.sender] = payload.name;
                             }
@@ -123,13 +143,10 @@
                 }
             });
 
-            // Always make sure you're counted as active on your own screen
             onlineUsers[myId] = myUsername;
-
             const userArray = Object.values(onlineUsers);
             countTag.textContent = `${userArray.length} online`;
             namesTag.textContent = userArray.join(', ');
-
         } catch (e) {}
     }
 
@@ -142,45 +159,126 @@
         } catch(e) {}
     }
 
-    async function send() {
-        const val = textInput.value.trim();
-        if (!val) return;
-
-        textInput.value = '';
-        
-        const msgId = Math.random().toString(36).substr(2, 9);
-        const msgPayload = {
-            type: 'chat',
-            id: msgId,
-            sender: myId,
-            name: myUsername,
-            text: val
-        };
-
-        // Render directly on our screen immediately
-        knownMessages.add(msgId);
-        renderSingleMessage(msgPayload);
-
+    // Main function to push payloads onto the data layer
+    async function transmitPayload(payload) {
         try {
-            // Push payload stream onto the global server channel
             await fetch(`https://ntfy.sh/${roomKey}`, {
                 method: 'POST',
-                body: JSON.stringify(msgPayload)
+                body: JSON.stringify(payload)
             });
         } catch (e) {}
     }
+
+    function sendText() {
+        const val = textInput.value.trim();
+        if (!val) return;
+        textInput.value = '';
+        
+        const msgId = Math.random().toString(36).substr(2, 9);
+        const payload = { type: 'chat', id: msgId, dataType: 'text', sender: myId, name: myUsername, text: val };
+        
+        knownMessages.add(msgId);
+        renderSingleMessage(payload);
+        transmitPayload(payload);
+    }
+
+    // Trigger local image picking view
+    document.getElementById('attach-btn').onclick = () => imageInput.click();
+
+    imageInput.onchange = () => {
+        const file = imageInput.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            const msgId = Math.random().toString(36).substr(2, 9);
+            const payload = { type: 'chat', id: msgId, dataType: 'image', sender: myId, name: myUsername, media: reader.result };
+            
+            knownMessages.add(msgId);
+            renderSingleMessage(payload);
+            transmitPayload(payload);
+        };
+        // Compress data payload size using direct standard Base-64 string encoding
+        reader.readAsDataURL(file);
+    };
+
+    // Voice Message Audio System Handler
+    document.getElementById('mic-btn').onclick = async function() {
+        const micBtn = this;
+        if (!isRecording) {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+                
+                mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+                mediaRecorder.onstop = () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    const reader = new FileReader();
+                    reader.onloadend = () => {
+                        const msgId = Math.random().toString(36).substr(2, 9);
+                        const payload = { type: 'chat', id: msgId, dataType: 'voice', sender: myId, name: myUsername, media: reader.result };
+                        
+                        knownMessages.add(msgId);
+                        renderSingleMessage(payload);
+                        transmitPayload(payload);
+                    };
+                    reader.readAsDataURL(audioBlob);
+                    
+                    // Kill micro-access loop cleanly to preserve device battery
+                    stream.getTracks().forEach(track => track.stop());
+                };
+
+                mediaRecorder.start();
+                isRecording = true;
+                micBtn.innerText = "🛑";
+                micBtn.classList.add('recording');
+            } catch (err) { alert("Microphone access denied or unsupported."); }
+        } else {
+            mediaRecorder.stop();
+            isRecording = false;
+            micBtn.innerText = "🎤";
+            micBtn.classList.remove('recording');
+        }
+    };
+
+    // Shared encrypted voice call linkage logic
+    callBtn.onclick = () => {
+        const callRoomName = roomKey.substr(0, 15) + "_call";
+        const callUrl = `https://meet.jit.si/${callRoomName}`;
+        
+        const msgId = Math.random().toString(36).substr(2, 9);
+        const payload = { type: 'chat', id: msgId, dataType: 'call', sender: myId, name: myUsername, text: `Join our private audio call room`, url: callUrl };
+        
+        knownMessages.add(msgId);
+        renderSingleMessage(payload);
+        transmitPayload(payload);
+        window.open(callUrl, '_blank');
+    };
 
     function renderSingleMessage(msg) {
         const bubble = document.createElement('div');
         const side = msg.sender === myId ? 'me' : 'them';
         bubble.className = `msg ${side}`;
-        bubble.innerText = side === 'them' ? `${msg.name}: ${msg.text}` : msg.text;
+        
+        const nameHeader = side === 'them' ? `<strong>${msg.name}:</strong><br>` : '';
+
+        if (msg.dataType === 'text') {
+            bubble.innerHTML = nameHeader + msg.text;
+        } else if (msg.dataType === 'image') {
+            bubble.innerHTML = nameHeader + `<img src="${msg.media}">`;
+        } else if (msg.dataType === 'voice') {
+            bubble.innerHTML = nameHeader + `<audio src="${msg.media}" controls></audio>`;
+        } else if (msg.dataType === 'call') {
+            bubble.innerHTML = nameHeader + `📞 <a href="${msg.url}" target="_blank" class="call-link">${msg.text}</a>`;
+        }
+        
         messagesContainer.appendChild(bubble);
         messagesContainer.scrollTop = messagesContainer.scrollHeight;
     }
 
-    document.getElementById('send-btn').onclick = send;
-    textInput.onkeypress = e => { if(e.key === 'Enter') send(); };
+    document.getElementById('send-btn').onclick = sendText;
+    textInput.onkeypress = e => { if(e.key === 'Enter') sendText(); };
 </script>
 </body>
 </html>
