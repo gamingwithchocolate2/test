@@ -12,7 +12,6 @@
         .header-top { display: flex; align-items: center; justify-content: space-between; }
         .header h1 { margin: 0; font-size: 18px; font-weight: 600; color: #fff; }
         
-        /* Members Counter styling */
         .members-indicator { font-size: 12px; color: #a1a1aa; background: #27272a; padding: 4px 8px; border-radius: 12px; display: flex; align-items: center; gap: 6px; font-weight: 500; }
         .members-indicator::before { content: ''; display: inline-block; width: 6px; height: 6px; background: #22c55e; border-radius: 50%; }
         .member-list { font-size: 11px; color: #71717a; margin: 0; padding-top: 2px; }
@@ -68,7 +67,7 @@
     const joinBtn = document.getElementById('join-btn');
     const countTag = document.getElementById('members-count'), namesTag = document.getElementById('members-names');
 
-    // Free open KVdb cluster instance bucket
+    // Cleaned public Key-Value endpoint bucket
     const bucketUrl = "https://kvdb.io/v3mN98Vf6H7v89bNf6vH89/";
 
     joinBtn.onclick = () => {
@@ -77,19 +76,19 @@
         if (!userIn || !roomIn) return alert('Fill out both boxes first');
         
         myUsername = userIn;
-        roomKey = 'rm_' + btoa(roomIn).replace(/[^a-zA-Z0-9]/g, '').toLowerCase().substr(0, 14);
+        // Strip out bad characters directly so room codes match 1:1 across devices
+        roomKey = 'room_' + roomIn.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
         
         setupView.classList.add('hidden');
         chatView.classList.remove('hidden');
         countTag.classList.remove('hidden');
         namesTag.classList.remove('hidden');
         
-        // Immediate synchronization cycles
         syncChat();
         syncMembers();
         
-        setInterval(syncChat, 2000);   // Grab messages every 2 seconds
-        setInterval(syncMembers, 4000); // Heartbeat presence tracking loop
+        setInterval(syncChat, 2000);   
+        setInterval(syncMembers, 4000); 
     };
 
     async function syncChat() {
@@ -107,27 +106,26 @@
 
     async function syncMembers() {
         try {
-            // Fetch current presence list
             let membersMap = {};
             const res = await fetch(`${bucketUrl}${roomKey}_mbrs`);
-            if (res.ok) membersMap = await res.json();
-
-            // Set/Update our own active timestamp
-            membersMap[myId] = { name: myUsername, lastSeen: Date.now() };
-
-            // Prune anyone who hasn't responded in over 10 seconds
-            const now = Date.now();
-            for (let id in membersMap) {
-                if (now - membersMap[id].lastSeen > 10000) delete membersMap[id];
+            if (res.ok) {
+                const text = await res.text();
+                if(text && text !== "null") membersMap = JSON.parse(text);
             }
 
-            // Write our refreshed status list back to cloud storage
+            membersMap[myId] = { name: myUsername, lastSeen: Date.now() };
+
+            const now = Date.now();
+            for (let id in membersMap) {
+                if (now - membersMap[id].lastSeen > 12000) delete membersMap[id];
+            }
+
+            // Fixed method to PUT so it successfully updates online status globally
             await fetch(`${bucketUrl}${roomKey}_mbrs`, {
-                method: 'POST',
+                method: 'PUT',
                 body: JSON.stringify(membersMap)
             });
 
-            // Display active list on screen
             const currentUsers = Object.values(membersMap);
             countTag.textContent = `${currentUsers.length} online`;
             namesTag.textContent = currentUsers.map(u => u.name).join(', ');
@@ -141,12 +139,11 @@
 
         textInput.value = '';
 
-        // Pull freshest logs first to handle concurrency conflicts cleanly
         try {
             const res = await fetch(`${bucketUrl}${roomKey}_msgs`);
             if (res.ok) {
-                const data = await res.json();
-                if (data) chatHistory = data;
+                const text = await res.text();
+                if(text && text !== "null") chatHistory = JSON.parse(text);
             }
         } catch(e) {}
         
@@ -156,8 +153,9 @@
         if (chatHistory.length > 30) chatHistory.shift();
 
         try {
+            // Fixed method to PUT to guarantee messages successfully push to her phone
             await fetch(`${bucketUrl}${roomKey}_msgs`, {
-                method: 'POST',
+                method: 'PUT',
                 body: JSON.stringify(chatHistory)
             });
         } catch (e) {}
@@ -169,7 +167,6 @@
             const bubble = document.createElement('div');
             const side = msg.sender === myId ? 'me' : 'them';
             bubble.className = `msg ${side}`;
-            // If it's a message from someone else, show their nickname
             bubble.innerText = side === 'them' ? `${msg.name}: ${msg.text}` : msg.text;
             messagesContainer.appendChild(bubble);
         });
